@@ -1,24 +1,18 @@
 import os
 import streamlit as st
-import pickle
 import hashlib
 from PyPDF2 import PdfReader
-from langchain.text_splitter import RecursiveCharacterTextSplitter
-from langchain_openai import OpenAIEmbeddings, ChatOpenAI
-from langchain.vectorstores.faiss import FAISS
-from langchain.memory import ConversationBufferMemory
-from langchain.chains import ConversationalRetrievalChain
+import openai
 
 # Page configuration
 st.set_page_config(
-    page_title="PDF Chatbot",
+    page_title="Simple PDF Chatbot",
     page_icon="📚",
     layout="wide",
 )
 
 # Ensure data directories exist
 os.makedirs("pdf_files", exist_ok=True)
-os.makedirs("vectorstores", exist_ok=True)
 
 # Password for admin panel (SHA-256 hash)
 ADMIN_PASSWORD_HASH = "8c6976e5b5410415bde908bd4dee15dfb167a9c873fc4bb8a81f6f2ab448a918"  # "admin"
@@ -36,8 +30,8 @@ if "chat_history" not in st.session_state:
 if "current_pdf" not in st.session_state:
     st.session_state.current_pdf = None
 
-if "conversation" not in st.session_state:
-    st.session_state.conversation = None
+if "pdf_content" not in st.session_state:
+    st.session_state.pdf_content = {}
 
 # Utility functions
 def hash_password(password):
@@ -58,83 +52,69 @@ def get_pdf_files():
     for filename in os.listdir("pdf_files"):
         if filename.endswith(".pdf"):
             name = filename[:-4]  # Remove .pdf extension
-            vector_path = os.path.join("vectorstores", f"{name}.pkl")
             pdfs[name] = {
                 "path": os.path.join("pdf_files", filename),
-                "processed": os.path.exists(vector_path),
-                "vector_path": vector_path
+                "processed": name in st.session_state.pdf_content
             }
     return pdfs
 
 def process_pdf(pdf_name, pdf_path):
-    """Process a PDF file and create embeddings."""
-    # Extract text from PDF
-    text = extract_text_from_pdf(pdf_path)
-    
-    # Split text into chunks
-    text_splitter = RecursiveCharacterTextSplitter(
-        chunk_size=1000,
-        chunk_overlap=200,
-        length_function=len
-    )
-    chunks = text_splitter.split_text(text)
-    
-    if not chunks:
-        return False, "Could not extract text from PDF. Make sure it contains selectable text."
-    
+    """Process a PDF file by extracting its text."""
     try:
-        # Create embeddings and vector store
-        embeddings = OpenAIEmbeddings(api_key=st.session_state.openai_api_key)
-        vectorstore = FAISS.from_texts(chunks, embeddings)
+        # Extract text from PDF
+        text = extract_text_from_pdf(pdf_path)
         
-        # Save vector store
-        vector_path = os.path.join("vectorstores", f"{pdf_name}.pkl")
-        with open(vector_path, "wb") as f:
-            pickle.dump(vectorstore, f)
+        if not text:
+            return False, "Could not extract text from PDF. Make sure it contains selectable text."
+        
+        # Store the PDF content in session state
+        st.session_state.pdf_content[pdf_name] = text
         
         return True, "PDF processed successfully."
     except Exception as e:
         return False, f"Error processing PDF: {str(e)}"
 
-def setup_conversation(vector_path):
-    """Set up the conversation chain."""
+def chat_with_pdf(question, pdf_content):
+    """Chat with a PDF using OpenAI API."""
     try:
-        # Load vector store
-        with open(vector_path, "rb") as f:
-            vectorstore = pickle.load(f)
+        # Setup OpenAI client
+        openai.api_key = st.session_state.openai_api_key
         
-        # Create LLM
-        llm = ChatOpenAI(
-            temperature=0.2,
+        # Create the prompt
+        prompt = f"""
+        I have a PDF document with the following content:
+        
+        {pdf_content[:4000]}  # Limit content to avoid token issues
+        
+        Based only on the information above, please answer the following question:
+        {question}
+        
+        If the answer is not in the provided content, please respond with: "I don't see information about that in the document."
+        """
+        
+        # Call the OpenAI API
+        response = openai.chat.completions.create(
             model="gpt-3.5-turbo",
-            api_key=st.session_state.openai_api_key
+            messages=[
+                {"role": "system", "content": "You are a helpful assistant that answers questions based only on the provided PDF content."},
+                {"role": "user", "content": prompt}
+            ],
+            max_tokens=1000,
+            temperature=0.3
         )
         
-        # Create memory
-        memory = ConversationBufferMemory(
-            memory_key="chat_history",
-            return_messages=True
-        )
-        
-        # Create chain
-        chain = ConversationalRetrievalChain.from_llm(
-            llm=llm,
-            retriever=vectorstore.as_retriever(search_kwargs={"k": 5}),
-            memory=memory
-        )
-        
-        return chain
+        # Return the response
+        return response.choices[0].message.content
     except Exception as e:
-        st.error(f"Error setting up conversation: {str(e)}")
-        return None
+        return f"Error generating response: {str(e)}"
 
 # Main app views
 def main_view():
     """Display the main view with options to go to admin or user view."""
-    st.title("📚 PDF Chatbot")
+    st.title("📚 Simple PDF Chatbot")
     
     st.write("""
-    Welcome to the PDF Chatbot! This application allows you to chat with your PDF documents.
+    Welcome to the Simple PDF Chatbot! This application allows you to chat with your PDF documents.
     
     ### Choose an option:
     """)
@@ -219,7 +199,7 @@ def admin_view():
             pdf_name = st.text_input("PDF Name (optional):", 
                                    help="Leave blank to use filename")
             process = st.checkbox("Process PDF after upload", value=True,
-                               help="Creates embeddings for chat functionality")
+                               help="Extracts text for chat functionality")
             
             submit = st.form_submit_button("Upload PDF")
             
@@ -293,9 +273,9 @@ def admin_view():
                                 if os.path.exists(info["path"]):
                                     os.remove(info["path"])
                                 
-                                # Delete vector store if exists
-                                if os.path.exists(info["vector_path"]):
-                                    os.remove(info["vector_path"])
+                                # Remove from session state if processed
+                                if name in st.session_state.pdf_content:
+                                    del st.session_state.pdf_content[name]
                                 
                                 st.success(f"PDF '{name}' deleted successfully.")
                                 st.experimental_rerun()
@@ -344,17 +324,10 @@ def user_view():
                 index=current_index
             )
             
-            # Initialize conversation when PDF changes
+            # Update current PDF
             if selected_pdf != st.session_state.current_pdf:
-                if not st.session_state.openai_api_key:
-                    st.error("Please provide an OpenAI API key.")
-                else:
-                    with st.spinner("Loading document..."):
-                        st.session_state.current_pdf = selected_pdf
-                        st.session_state.conversation = setup_conversation(
-                            processed_pdfs[selected_pdf]["vector_path"]
-                        )
-                        st.session_state.chat_history = []
+                st.session_state.current_pdf = selected_pdf
+                st.session_state.chat_history = []
         
         # Back button
         if st.button("Back to Main"):
@@ -366,7 +339,7 @@ def user_view():
         st.warning("Please enter your OpenAI API key in the sidebar to start chatting.")
     elif not processed_pdfs:
         st.warning("No processed PDFs available. Ask an administrator to upload and process documents.")
-    elif not st.session_state.conversation:
+    elif not st.session_state.current_pdf:
         st.info("Select a PDF from the sidebar to start chatting.")
     else:
         # Display chat messages
@@ -388,14 +361,12 @@ def user_view():
             # Generate and display response
             with st.chat_message("assistant"):
                 with st.spinner("Thinking..."):
-                    try:
-                        response = st.session_state.conversation.run(user_question)
-                        st.write(response)
-                        
-                        # Add assistant message to chat history
-                        st.session_state.chat_history.append({"role": "assistant", "content": response})
-                    except Exception as e:
-                        st.error(f"Error generating response: {str(e)}")
+                    pdf_content = st.session_state.pdf_content.get(st.session_state.current_pdf, "")
+                    response = chat_with_pdf(user_question, pdf_content)
+                    st.write(response)
+                    
+                    # Add assistant message to chat history
+                    st.session_state.chat_history.append({"role": "assistant", "content": response})
         
         # Reset chat button
         if st.session_state.chat_history and st.button("Clear Chat"):
